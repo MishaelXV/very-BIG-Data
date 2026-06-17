@@ -1,0 +1,224 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# IoT Streaming Pipeline
+#
+# Topology:
+#   generator  →  kafka (iot_events)  →  flink  →  kafka (iot_aggregated)
+#                                          ↑
+#                                       postgres (device_types reference)
+#
+# Services:
+#   kafka              — Kafka 3.7 in KRaft mode (no Zookeeper required)
+#   kafka-init         — one-shot container: creates Kafka topics then exits
+#   postgres           — PostgreSQL 15, device_types reference table
+#   flink-jobmanager   — Flink 1.18 JobManager + REST/Web UI on port 8081
+#   flink-taskmanager  — Flink 1.18 TaskManager with 4 task slots
+#   generator          — Python IoT event producer (1 event/second)
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  iot_net:
+    name: iot_net
+    driver: bridge
+
+volumes:
+  postgres_data:      # persistent PostgreSQL data directory
+
+services:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Kafka — apache/kafka:3.7.0 in KRaft mode (no Zookeeper)
+  # Works on Mac arm64 and amd64.
+  #
+  # Listeners:
+  #   INTERNAL   kafka:9092      → used by all containers in iot_net
+  #   EXTERNAL   localhost:9093  → exposed to host for CLI tools / kafkacat
+  #   CONTROLLER kafka:9091      → KRaft quorum channel (not exposed)
+  #
+  # CLUSTER_ID — required by apache/kafka for KRaft initialisation;
+  #              fixed value is fine for a single-node dev cluster.
+  # ───────────────────────────────────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka
+    hostname: kafka
+    networks:
+      - iot_net
+    ports:
+      - "9093:9093"   # EXTERNAL listener → host port 9093
+    environment:
+      # KRaft: single node acts as both broker and controller
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9091"
+
+      # Listener configuration
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:9091"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
+      # Replication factors — must be 1 for a single-node cluster
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+
+      # Disable auto topic creation; topics are created by kafka-init
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # Keep messages for 1 hour (sufficient for dev/learning)
+      KAFKA_LOG_RETENTION_HOURS: "1"
+
+      # Required by apache/kafka entrypoint to initialise KRaft storage
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Kafka Init — runs create_topics.sh once, then exits with code 0.
+  # Generator waits for service_completed_successfully before starting.
+  # ───────────────────────────────────────────────────────────────────────────
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: kafka-init
+    networks:
+      - iot_net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./kafka/create_topics.sh:/create_topics.sh:ro
+    entrypoint: ["bash", "/create_topics.sh"]
+    restart: "no"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # PostgreSQL — device_types reference table
+  # SQL files in /docker-entrypoint-initdb.d/ are executed once on first start
+  # in lexicographic order: 01_ddl.sql → 02_dml.sql
+  # ───────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    hostname: postgres
+    networks:
+      - iot_net
+    ports:
+      - "5432:5432"   # expose to host for psql / DB GUI tools
+    environment:
+      POSTGRES_USER: iot_user
+      POSTGRES_PASSWORD: iot_pass
+      POSTGRES_DB: iot_db
+    volumes:
+      - ./postgres/ddl.sql:/docker-entrypoint-initdb.d/01_ddl.sql:ro
+      - ./postgres/dml.sql:/docker-entrypoint-initdb.d/02_dml.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot_user -d iot_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Flink JobManager — coordinates task scheduling, exposes REST + Web UI
+  # Web UI: http://localhost:8081
+  #
+  # Submit PyFlink job manually:
+  #   docker exec -it flink-jobmanager python /job/iot_job.py
+  # ───────────────────────────────────────────────────────────────────────────
+  flink-jobmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    image: iot-flink:1.18   # built locally; reused by flink-taskmanager
+    container_name: flink-jobmanager
+    hostname: flink-jobmanager
+    networks:
+      - iot_net
+    ports:
+      - "8081:8081"   # Flink Web UI / REST API
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1600m
+        rest.bind-address: 0.0.0.0
+      # Env vars read by iot_job.py at runtime
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_INPUT_TOPIC: iot_events
+      KAFKA_OUTPUT_TOPIC: iot_aggregated
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: iot_db
+      POSTGRES_USER: iot_user
+      POSTGRES_PASSWORD: iot_pass
+    volumes:
+      - ./flink:/job:ro   # job code is run with: python /job/iot_job.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Flink TaskManager — executes tasks assigned by the JobManager
+  # 4 task slots = supports up to 4 parallel operators
+  # ───────────────────────────────────────────────────────────────────────────
+  flink-taskmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    image: iot-flink:1.18   # same Dockerfile as jobmanager; Docker builds once
+    container_name: flink-taskmanager
+    hostname: flink-taskmanager
+    networks:
+      - iot_net
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1728m
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_INPUT_TOPIC: iot_events
+      KAFKA_OUTPUT_TOPIC: iot_aggregated
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: iot_db
+      POSTGRES_USER: iot_user
+      POSTGRES_PASSWORD: iot_pass
+    volumes:
+      - ./flink:/job:ro
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # IoT Generator — publishes one IoT event per second to iot_events
+  # Restarts automatically if it crashes (e.g., Kafka not yet ready)
+  # ───────────────────────────────────────────────────────────────────────────
+  generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    container_name: generator
+    hostname: generator
+    networks:
+      - iot_net
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: iot_events
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
