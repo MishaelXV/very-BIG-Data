@@ -195,7 +195,7 @@ docker exec kafka /opt/kafka/bin/kafka-topics.sh \
 Генератор стартует автоматически вместе с `docker compose up`. Проверить логи:
 
 ```bash
-docker logs -f generator
+docker logs -f generatorb
 ```
 
 Ожидаемый вывод (одна строка в секунду):

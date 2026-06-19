@@ -1,36 +1,3 @@
-"""
-IoT Streaming Aggregation Job — PyFlink 1.18 DataStream API
-
-Pipeline:
-  KafkaSource (iot_events, raw JSON strings)
-    → WatermarkStrategy: for_bounded_out_of_orderness(5 s)
-      + IotTimestampAssigner: parses event_time from raw JSON → epoch ms
-    → map: parse JSON + enrich with device_type_name in ONE step
-      output type: TUPLE[INT, DOUBLE, DOUBLE, STRING]
-                   (device_type_id, temperature, humidity, device_type_name)
-    → key_by: device_type_id  (tuple index 0)
-    → TumblingEventTimeWindows(60 s)
-    → ProcessWindowFunction: avg_temperature, median_humidity, events_count
-    → KafkaSink (iot_aggregated, JSON strings)
-
-Why the original pipeline broke
-  The original design serialised enrich_event's output as a JSON string (Types.STRING)
-  between two Python map operators. PyFlink 1.18 passes data between Python operators
-  through the JVM serialisation layer. When dill cannot round-trip the closure that
-  captures `device_types`, the first map silently emits malformed or missing output,
-  so the second map receives a JSON dict without `device_type_id` → KeyError.
-
-Fix: merge parse + enrich into a single map operator and use a typed Tuple instead of
-     an intermediate JSON string. Only one json.loads per record (in _fn below) and
-     one json.dumps at the very end (in AggregateByDeviceType.process).
-
-Constraints honoured
-  - No RichMapFunction       (not importable in PyFlink 1.18)
-  - No SerializableTimestampAssigner  (does not exist — using TimestampAssigner)
-  - No output_type in filter()        (not supported)
-  - PostgreSQL loaded once before pipeline construction
-"""
-
 import json
 import logging
 import os
@@ -76,9 +43,7 @@ PG_DSN: dict = {
 
 WINDOW_SIZE_SECONDS = 60
 
-# Explicit Flink type for elements flowing from the map operator to the window.
-# (device_type_id: INT, temperature: DOUBLE, humidity: DOUBLE, device_type_name: STRING)
-# Using DOUBLE avoids 32-bit float precision loss for sensor values.
+
 ENRICHED_TYPE = Types.TUPLE([
     Types.INT(),
     Types.DOUBLE(),
@@ -144,7 +109,7 @@ def make_parse_and_enrich(device_types: dict):
     JSON string between two Python operators — the root cause of the KeyError.
     dill serialises _dt (a plain {int: str} dict) reliably as part of the closure.
     """
-    _dt = dict(device_types)  # local copy; serialised with the closure by dill
+    _dt = dict(device_types)  
 
     def _fn(raw: str):
         d = json.loads(raw)
@@ -258,48 +223,31 @@ def main():
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
-    # Watermark strategy:
-    #   for_bounded_out_of_orderness(5s) — tolerate 5-second late arrivals
-    #   IotTimestampAssigner             — extracts epoch ms from raw JSON event_time
     watermark_strategy = (
         WatermarkStrategy
         .for_bounded_out_of_orderness(Duration.of_seconds(5))
         .with_idleness(Duration.of_seconds(10))
         .with_timestamp_assigner(IotTimestampAssigner()))
 
-    # Load reference table once — serialised into the map closure by dill.
     device_types = load_device_types(PG_DSN)
 
     (
         env
-
-        # ① Read raw JSON strings from Kafka; stamp event-time watermarks at source.
         .from_source(
             build_kafka_source(),
             watermark_strategy,
             "Kafka Source: iot_events",
         )
 
-        # ② Parse raw JSON + enrich with device_type_name in ONE operator.
-        #    Output: (device_type_id, temperature, humidity, device_type_name)
-        #    Explicit ENRICHED_TYPE prevents PyFlink type-inference ambiguity.
         .map(
             make_parse_and_enrich(device_types),
             output_type=ENRICHED_TYPE,
         )
 
-        # ③ Partition stream by device_type_id (tuple index 0).
         .key_by(lambda t: t[0])
-
-        # ④ Open 1-minute tumbling event-time window per key.
-        #    Window closes when watermark ≥ window_end (+ 5 s bounded lateness).
         .window(TumblingEventTimeWindows.of(Time.seconds(WINDOW_SIZE_SECONDS)))
-
-        # ⑤ Aggregate: avg_temperature, median_humidity, events_count.
-        #    First json.dumps in this pipeline — only happens once per window bucket.
+        
         .process(AggregateByDeviceType(), output_type=Types.STRING())
-
-        # ⑥ Write JSON aggregates to Kafka.
         .sink_to(build_kafka_sink())
     )
 
